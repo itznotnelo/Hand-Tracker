@@ -4,13 +4,15 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Nelo | Hand-Tracking UI</title>
-    
-    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
-    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3.1675466862/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils@0.3.1675466124/drawing_utils.js" crossorigin="anonymous"></script>
 
     <style>
         :root {
             --primary: #00f2ff;
+            --accent: #ff9d00;
             --bg: #0a0a0a;
             --card: rgba(255, 255, 255, 0.05);
         }
@@ -56,6 +58,23 @@
             transform: scale(1.05);
         }
 
+        .card.dragging {
+            cursor: grabbing;
+            border-color: var(--accent);
+            box-shadow: 0 0 40px rgba(255, 157, 0, 0.35);
+            transform: scale(1.08);
+        }
+
+        .card.swiped {
+            animation: pulse 0.4s ease;
+        }
+
+        @keyframes pulse {
+            0% { transform: scale(1); }
+            50% { transform: scale(1.08); }
+            100% { transform: scale(1); }
+        }
+
         /* Virtueller Hand-Cursor */
         #hand-cursor {
             position: fixed;
@@ -66,7 +85,7 @@
             pointer-events: none;
             z-index: 9999;
             transform: translate(-50%, -50%);
-            transition: width 0.1s, height 0.1s, background 0.1s;
+            transition: width 0.1s, height 0.1s, background 0.1s, border-color 0.1s;
         }
 
         #hand-cursor.pinched {
@@ -76,22 +95,90 @@
             box-shadow: 0 0 20px var(--primary);
         }
 
+        #hand-cursor.grabbing {
+            border-color: var(--accent);
+            background: rgba(255, 157, 0, 0.25);
+            box-shadow: 0 0 20px var(--accent);
+        }
+
         .status {
             position: absolute;
             top: 20px;
             left: 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+
+        .status #status-main {
             font-size: 12px;
             text-transform: uppercase;
             letter-spacing: 2px;
             color: var(--primary);
         }
+
+        .status-row {
+            font-size: 11px;
+            color: rgba(255, 255, 255, 0.6);
+        }
+
+        .status-row span {
+            color: var(--primary);
+            font-weight: 600;
+        }
+
+        /* Gespiegelte Mini-Vorschau mit Hand-Skelett */
+        #skeleton-preview {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            width: 213px;
+            height: 120px;
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            border-radius: 12px;
+            background: rgba(255, 255, 255, 0.03);
+            backdrop-filter: blur(10px);
+            z-index: 50;
+        }
+
+        #swipe-toast {
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%) scale(0.9);
+            padding: 12px 28px;
+            border-radius: 999px;
+            background: rgba(0, 242, 255, 0.12);
+            border: 1px solid var(--primary);
+            color: var(--primary);
+            font-size: 14px;
+            letter-spacing: 3px;
+            text-transform: uppercase;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.25s ease, transform 0.25s ease;
+            z-index: 9998;
+        }
+
+        #swipe-toast.show {
+            opacity: 1;
+            transform: translate(-50%, -50%) scale(1);
+        }
     </style>
 </head>
 <body>
 
-    <div class="status" id="status">Warte auf Kamera...</div>
+    <div class="status" id="status">
+        <div id="status-main">Warte auf Kamera...</div>
+        <div class="status-row">Geste: <span id="gesture-label">–</span></div>
+        <div class="status-row">FPS: <span id="fps-label">–</span></div>
+        <div class="status-row">Hände: <span id="hands-label">0</span></div>
+    </div>
+
     <div id="hand-cursor"></div>
+    <div id="swipe-toast"></div>
     <video id="input_video"></video>
+    <canvas id="skeleton-preview"></canvas>
 
     <div class="dashboard">
         <div class="card" id="card1"><h3>System</h3><p>Automatisierung</p></div>
@@ -100,65 +187,242 @@
     </div>
 
     <script>
+        // ---------------------------------------------------------------
+        // Reine Gesten-Logik (keine DOM-/Kamera-Abhängigkeit, testbar)
+        // ---------------------------------------------------------------
+        const FINGER_JOINTS = {
+            index: { mcp: 5, tip: 8 },
+            middle: { mcp: 9, tip: 12 },
+            ring: { mcp: 13, tip: 16 },
+            pinky: { mcp: 17, tip: 20 },
+        };
+        const EXTEND_FACTOR = 1.2;   // tip muss >20% weiter vom Handgelenk sein als mcp
+        const SWIPE_WINDOW_MS = 250; // Zeitfenster für eine Swipe-Bewegung
+        const SWIPE_MIN_DX = 150;    // Mindestbewegung in px innerhalb des Fensters
+
+        function distance(a, b) {
+            return Math.sqrt(Math.pow(a.x - b.x, 2) + Math.pow(a.y - b.y, 2));
+        }
+
+        function isFingerExtended(landmarks, joints) {
+            const wrist = landmarks[0];
+            return distance(wrist, landmarks[joints.tip]) > distance(wrist, landmarks[joints.mcp]) * EXTEND_FACTOR;
+        }
+
+        // 'open' | 'fist' | 'point' anhand von Index/Mittel/Ring/Kleinem Finger
+        function classifyGesture(landmarks) {
+            if (!landmarks) return 'none';
+            const extendedCount = Object.values(FINGER_JOINTS)
+                .filter(joints => isFingerExtended(landmarks, joints)).length;
+            if (extendedCount >= 3) return 'open';
+            if (extendedCount === 0) return 'fist';
+            return 'point';
+        }
+
+        // history: [{x, t}, ...] neueste zuletzt. Gibt 'left' | 'right' | null zurück.
+        function detectSwipe(history) {
+            if (history.length < 2) return null;
+            const latest = history[history.length - 1];
+            const windowStart = latest.t - SWIPE_WINDOW_MS;
+            let oldest = null;
+            for (let i = history.length - 1; i >= 0; i--) {
+                if (history[i].t >= windowStart) oldest = history[i];
+                else break;
+            }
+            if (!oldest) return null;
+            const dx = latest.x - oldest.x;
+            if (Math.abs(dx) < SWIPE_MIN_DX) return null;
+            return dx > 0 ? 'right' : 'left';
+        }
+
+        function selfTest() {
+            const wrist = { x: 0, y: 0 };
+            const near = { x: 0, y: 0.05 };  // eingerolltes Fingerglied: dicht am Handgelenk
+            const farMcp = { x: 0, y: 0.3 };
+            const farTip = { x: 0, y: 0.6 }; // ausgestrecktes Fingerglied
+
+            const buildHand = (extended) => {
+                const l = new Array(21).fill(wrist);
+                for (const joints of Object.values(FINGER_JOINTS)) {
+                    l[joints.mcp] = farMcp;
+                    l[joints.tip] = extended ? farTip : near;
+                }
+                return l;
+            };
+
+            console.assert(classifyGesture(buildHand(true)) === 'open', '[selfTest] offene Hand sollte "open" ergeben');
+            console.assert(classifyGesture(buildHand(false)) === 'fist', '[selfTest] Faust sollte "fist" ergeben');
+            console.assert(detectSwipe([{ x: 0, t: 0 }, { x: 200, t: 100 }]) === 'right', '[selfTest] schnelle Rechtsbewegung sollte Swipe rechts sein');
+            console.assert(detectSwipe([{ x: 0, t: 0 }, { x: 10, t: 100 }]) === null, '[selfTest] kleine Bewegung sollte kein Swipe sein');
+            console.log('[selfTest] Gesten-/Swipe-Checks bestanden');
+        }
+        selfTest();
+
+        // ---------------------------------------------------------------
+        // UI-Wiring
+        // ---------------------------------------------------------------
         const videoElement = document.getElementById('input_video');
         const cursor = document.getElementById('hand-cursor');
-        const statusText = document.getElementById('status');
-        const cards = document.querySelectorAll('.card');
+        const statusMain = document.getElementById('status-main');
+        const gestureLabel = document.getElementById('gesture-label');
+        const fpsLabel = document.getElementById('fps-label');
+        const handsLabel = document.getElementById('hands-label');
+        const swipeToast = document.getElementById('swipe-toast');
+        const cards = Array.from(document.querySelectorAll('.card'));
+        const previewCanvas = document.getElementById('skeleton-preview');
+        const previewCtx = previewCanvas.getContext('2d');
+        previewCanvas.width = 213;
+        previewCanvas.height = 120;
 
-        function onResults(results) {
-            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
-                statusText.innerText = "Tracking Aktiv";
-                const landmarks = results.multiHandLandmarks[0];
-                
-                // Punkte: 8 (Zeigefinger Spitze), 4 (Daumen Spitze)
-                const indexTip = landmarks[8];
-                const thumbTip = landmarks[4];
+        let prevGesture = 'none';
+        let dragCard = null;
+        let dragOffset = { x: 0, y: 0 };
+        let swipeHistory = [];
+        let lastSwipeAt = 0;
+        let swipeToastTimer = null;
+        let activeCardIndex = 0;
+        let lastFrameTime = performance.now();
+        let smoothedFps = 0;
 
-                // Umrechnung auf Bildschirmgröße
-                const x = (1 - indexTip.x) * window.innerWidth;
-                const y = indexTip.y * window.innerHeight;
+        function showToast(text) {
+            swipeToast.textContent = text;
+            swipeToast.classList.add('show');
+            clearTimeout(swipeToastTimer);
+            swipeToastTimer = setTimeout(() => swipeToast.classList.remove('show'), 900);
+        }
 
-                // Cursor bewegen
-                cursor.style.left = `${x}px`;
-                cursor.style.top = `${y}px`;
-
-                // Pinch-Logik (Klick-Simulation)
-                const distance = Math.sqrt(
-                    Math.pow(indexTip.x - thumbTip.x, 2) + 
-                    Math.pow(indexTip.y - thumbTip.y, 2)
-                );
-
-                if (distance < 0.05) {
-                    cursor.classList.add('pinched');
-                    checkCollision(x, y, true);
-                } else {
-                    cursor.classList.remove('pinched');
-                    checkCollision(x, y, false);
-                }
-            } else {
-                statusText.innerText = "Keine Hand erkannt";
-            }
+        function cardUnderPoint(x, y) {
+            return cards.find(card => {
+                const rect = card.getBoundingClientRect();
+                return x > rect.left && x < rect.right && y > rect.top && y < rect.bottom;
+            }) || null;
         }
 
         function checkCollision(x, y, isPinching) {
             cards.forEach(card => {
+                if (card === dragCard) return;
                 const rect = card.getBoundingClientRect();
                 if (x > rect.left && x < rect.right && y > rect.top && y < rect.bottom) {
                     card.classList.add('active');
-                    if (isPinching) {
-                        card.style.background = "rgba(0, 242, 255, 0.3)";
-                    } else {
-                        card.style.background = "rgba(255, 255, 255, 0.1)";
-                    }
+                    card.style.background = isPinching ? 'rgba(0, 242, 255, 0.3)' : 'rgba(255, 255, 255, 0.1)';
                 } else {
                     card.classList.remove('active');
-                    card.style.background = "rgba(255, 255, 255, 0.05)";
+                    card.style.background = 'rgba(255, 255, 255, 0.05)';
                 }
             });
         }
 
+        function updateDrag(gesture, x, y) {
+            if (gesture === 'fist' && prevGesture !== 'fist') {
+                const card = cardUnderPoint(x, y);
+                if (card) {
+                    const rect = card.getBoundingClientRect();
+                    dragCard = card;
+                    dragOffset = { x: x - rect.left, y: y - rect.top };
+                    card.style.position = 'fixed';
+                    card.style.left = rect.left + 'px';
+                    card.style.top = rect.top + 'px';
+                    card.style.width = rect.width + 'px';
+                    card.style.zIndex = 1000;
+                    card.classList.add('dragging');
+                }
+            }
+
+            if (gesture === 'fist' && dragCard) {
+                dragCard.style.left = (x - dragOffset.x) + 'px';
+                dragCard.style.top = (y - dragOffset.y) + 'px';
+            }
+
+            if (gesture !== 'fist' && dragCard) {
+                // ponytail: die freie Grid-Zelle bleibt leer, kein Nachrücken der übrigen Karten
+                dragCard.classList.remove('dragging');
+                dragCard.style.zIndex = '';
+                dragCard = null;
+            }
+        }
+
+        function updateSwipe(gesture, x) {
+            if (dragCard) { swipeHistory = []; return; }
+            const now = performance.now();
+            swipeHistory.push({ x, t: now });
+            swipeHistory = swipeHistory.filter(sample => now - sample.t <= SWIPE_WINDOW_MS);
+
+            if (now - lastSwipeAt < 600) return;
+            const direction = detectSwipe(swipeHistory);
+            if (!direction) return;
+
+            lastSwipeAt = now;
+            swipeHistory = [];
+            cards[activeCardIndex].classList.remove('swiped');
+            activeCardIndex = (activeCardIndex + (direction === 'right' ? 1 : -1) + cards.length) % cards.length;
+            const nextCard = cards[activeCardIndex];
+            nextCard.classList.add('swiped');
+            setTimeout(() => nextCard.classList.remove('swiped'), 400);
+            showToast('Swipe ' + direction);
+        }
+
+        function drawSkeletonPreview(landmarks) {
+            previewCtx.save();
+            previewCtx.clearRect(0, 0, previewCanvas.width, previewCanvas.height);
+            if (!landmarks) { previewCtx.restore(); return; }
+
+            // gespiegelt, wie ein Selfie-Feed
+            previewCtx.translate(previewCanvas.width, 0);
+            previewCtx.scale(-1, 1);
+            drawConnectors(previewCtx, landmarks, HAND_CONNECTIONS, { color: 'rgba(0, 242, 255, 0.6)', lineWidth: 2 });
+            drawLandmarks(previewCtx, landmarks, { color: '#00f2ff', lineWidth: 1, radius: 2 });
+            previewCtx.restore();
+        }
+
+        function updateFps() {
+            const now = performance.now();
+            const instantFps = 1000 / (now - lastFrameTime);
+            lastFrameTime = now;
+            smoothedFps = smoothedFps ? smoothedFps * 0.9 + instantFps * 0.1 : instantFps;
+            fpsLabel.textContent = Math.round(smoothedFps);
+        }
+
+        function onResults(results) {
+            updateFps();
+            const hasHand = results.multiHandLandmarks && results.multiHandLandmarks.length > 0;
+            handsLabel.textContent = hasHand ? results.multiHandLandmarks.length : 0;
+            drawSkeletonPreview(hasHand ? results.multiHandLandmarks[0] : null);
+
+            if (!hasHand) {
+                statusMain.innerText = 'Keine Hand erkannt';
+                gestureLabel.textContent = '–';
+                cursor.classList.remove('pinched', 'grabbing');
+                prevGesture = 'none';
+                return;
+            }
+
+            statusMain.innerText = 'Tracking Aktiv';
+            const landmarks = results.multiHandLandmarks[0];
+            const indexTip = landmarks[8];
+            const thumbTip = landmarks[4];
+
+            const x = (1 - indexTip.x) * window.innerWidth;
+            const y = indexTip.y * window.innerHeight;
+            cursor.style.left = `${x}px`;
+            cursor.style.top = `${y}px`;
+
+            const gesture = classifyGesture(landmarks);
+            gestureLabel.textContent = gesture;
+
+            const pinchDistance = distance(indexTip, thumbTip);
+            const isPinching = pinchDistance < 0.05;
+            cursor.classList.toggle('pinched', isPinching && gesture !== 'fist');
+            cursor.classList.toggle('grabbing', gesture === 'fist');
+
+            checkCollision(x, y, isPinching);
+            updateDrag(gesture, x, y);
+            updateSwipe(gesture, x);
+
+            prevGesture = gesture;
+        }
+
         const hands = new Hands({
-            locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+            locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${file}`
         });
 
         hands.setOptions({
@@ -172,7 +436,7 @@
 
         const camera = new Camera(videoElement, {
             onFrame: async () => {
-                await hands.send({image: videoElement});
+                await hands.send({ image: videoElement });
             },
             width: 1280,
             height: 720
