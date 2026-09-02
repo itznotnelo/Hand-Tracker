@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nelo | Hand-Tracking UI</title>
+    
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+
+    <style>
+        :root {
+            --primary: #00f2ff;
+            --bg: #0a0a0a;
+            --card: rgba(255, 255, 255, 0.05);
+        }
+
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: var(--bg);
+            color: white;
+            font-family: 'Inter', system-ui, sans-serif;
+            overflow: hidden;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+        }
+
+        /* Video versteckt im Hintergrund für Daten */
+        #input_video { display: none; }
+
+        /* UI Layer */
+        .dashboard {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 20px;
+            max-width: 1000px;
+            z-index: 2;
+        }
+
+        .card {
+            background: var(--card);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            padding: 40px;
+            border-radius: 20px;
+            text-align: center;
+            transition: all 0.3s ease;
+        }
+
+        .card.active {
+            border-color: var(--primary);
+            box-shadow: 0 0 30px rgba(0, 242, 255, 0.2);
+            transform: scale(1.05);
+        }
+
+        /* Virtueller Hand-Cursor */
+        #hand-cursor {
+            position: fixed;
+            width: 30px;
+            height: 30px;
+            border: 2px solid var(--primary);
+            border-radius: 50%;
+            pointer-events: none;
+            z-index: 9999;
+            transform: translate(-50%, -50%);
+            transition: width 0.1s, height 0.1s, background 0.1s;
+        }
+
+        #hand-cursor.pinched {
+            width: 15px;
+            height: 15px;
+            background: var(--primary);
+            box-shadow: 0 0 20px var(--primary);
+        }
+
+        .status {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+            color: var(--primary);
+        }
+    </style>
+</head>
+<body>
+
+    <div class="status" id="status">Warte auf Kamera...</div>
+    <div id="hand-cursor"></div>
+    <video id="input_video"></video>
+
+    <div class="dashboard">
+        <div class="card" id="card1"><h3>System</h3><p>Automatisierung</p></div>
+        <div class="card" id="card2"><h3>Scale</h3><p>Skalierung</p></div>
+        <div class="card" id="card3"><h3>Focus</h3><p>Effizienz</p></div>
+    </div>
+
+    <script>
+        const videoElement = document.getElementById('input_video');
+        const cursor = document.getElementById('hand-cursor');
+        const statusText = document.getElementById('status');
+        const cards = document.querySelectorAll('.card');
+
+        function onResults(results) {
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                statusText.innerText = "Tracking Aktiv";
+                const landmarks = results.multiHandLandmarks[0];
+                
+                // Punkte: 8 (Zeigefinger Spitze), 4 (Daumen Spitze)
+                const indexTip = landmarks[8];
+                const thumbTip = landmarks[4];
+
+                // Umrechnung auf Bildschirmgröße
+                const x = (1 - indexTip.x) * window.innerWidth;
+                const y = indexTip.y * window.innerHeight;
+
+                // Cursor bewegen
+                cursor.style.left = `${x}px`;
+                cursor.style.top = `${y}px`;
+
+                // Pinch-Logik (Klick-Simulation)
+                const distance = Math.sqrt(
+                    Math.pow(indexTip.x - thumbTip.x, 2) + 
+                    Math.pow(indexTip.y - thumbTip.y, 2)
+                );
+
+                if (distance < 0.05) {
+                    cursor.classList.add('pinched');
+                    checkCollision(x, y, true);
+                } else {
+                    cursor.classList.remove('pinched');
+                    checkCollision(x, y, false);
+                }
+            } else {
+                statusText.innerText = "Keine Hand erkannt";
+            }
+        }
+
+        function checkCollision(x, y, isPinching) {
+            cards.forEach(card => {
+                const rect = card.getBoundingClientRect();
+                if (x > rect.left && x < rect.right && y > rect.top && y < rect.bottom) {
+                    card.classList.add('active');
+                    if (isPinching) {
+                        card.style.background = "rgba(0, 242, 255, 0.3)";
+                    } else {
+                        card.style.background = "rgba(255, 255, 255, 0.1)";
+                    }
+                } else {
+                    card.classList.remove('active');
+                    card.style.background = "rgba(255, 255, 255, 0.05)";
+                }
+            });
+        }
+
+        const hands = new Hands({
+            locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+        });
+
+        hands.setOptions({
+            maxNumHands: 1,
+            modelComplexity: 1,
+            minDetectionConfidence: 0.8,
+            minTrackingConfidence: 0.8
+        });
+
+        hands.onResults(onResults);
+
+        const camera = new Camera(videoElement, {
+            onFrame: async () => {
+                await hands.send({image: videoElement});
+            },
+            width: 1280,
+            height: 720
+        });
+        camera.start();
+    </script>
+</body>
+</html>
